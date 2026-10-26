@@ -313,6 +313,11 @@ type ConversationBranch struct {
 	HandoffNote            string
 }
 
+type ConversationChangeClock struct {
+	ID     int64
+	Cursor int64
+}
+
 type ConversationEditDelivery struct {
 	ConversationID      string
 	ClientMessageID     string
@@ -376,6 +381,13 @@ type ConversationQueuedEditDelivery struct {
 	ClientMessageID string
 	RequestHash     string
 	CreatedAt       time.Time
+}
+
+type ConversationRowChange struct {
+	ConversationID string
+	Kind           string
+	RowID          string
+	ChangedAt      int64
 }
 
 type ConversationSteerDelivery struct {

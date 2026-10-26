@@ -5476,10 +5476,13 @@ export interface components {
             account?: components["schemas"]["ConversationAccountPayload"];
             activeBranchId?: string;
             activities: components["schemas"]["ConversationActivityResponse"][];
+            afterSequence?: null | number;
             branchMaterialization?: components["schemas"]["ConversationBranchMaterializationResponse"];
             branchPoints?: components["schemas"]["ConversationBranchPointResponse"][];
             branchedFromEarlierMessage: boolean;
             capabilities?: string[];
+            /** Format: int64 */
+            changeCursor?: number;
             compactedAt?: null | string;
             continueTurnId: string;
             /** @enum {string} */
@@ -5506,6 +5509,8 @@ export interface components {
             title?: string;
             turns: components["schemas"]["ConversationTurnResponse"][];
             usage?: components["schemas"]["ConversationUsagePayload"];
+            /** Format: int64 */
+            visibleAfterSequence?: number;
         };
         ConversationThreadStatePayload: {
             archivedAt?: null | string;
@@ -16019,6 +16024,10 @@ export interface operations {
                 beforeSequence?: null | number;
                 /** @description Maximum messages to return; tool activity between them comes along without counting. Defaults to 200. */
                 limit?: null | number;
+                /** @description Newest page only: include rows at or after this sequence. Echoed only for complete deltas. */
+                afterSequence?: null | number;
+                /** @description Include every row rewritten after this durable change cursor, regardless of its timeline sequence. Requires afterSequence. */
+                afterChange?: null | number;
             };
             header?: never;
             path: {

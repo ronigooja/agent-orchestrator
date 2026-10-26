@@ -850,6 +850,9 @@ export interface McpServer {
 }
 
 export interface ConversationSnapshot {
+	changeCursor?: number;
+	visibleAfterSequence?: number;
+	afterSequence?: number;
 	/** Backend-selected dispatched turn; an empty value means Continue is unavailable. */
 	continueTurnId?: string;
 	conversationId: string;
