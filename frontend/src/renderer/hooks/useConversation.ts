@@ -392,6 +392,13 @@ export async function refreshLocalConversation(queryClient: QueryClient, session
 	const previous = queryClient.getQueryData<InfiniteData<ConversationSnapshot>>(queryKey);
 	const live = previous?.pages[0];
 	const fallback = () => queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false });
+	if (queryClient.isFetching({ queryKey, type: "active" }) > 0) {
+		// Joining a request that predates the event cannot acknowledge that event.
+		// Read its cursor, then catch up after it settles.
+		await fallback();
+		await refreshLocalConversation(queryClient, sessionId);
+		return;
+	}
 	// Inactive caches must remain stale so opening them uses a full snapshot.
 	const active = queryClient.getQueryCache().find({ queryKey, exact: true })?.isActive();
 	if (!active) {
@@ -400,13 +407,6 @@ export async function refreshLocalConversation(queryClient: QueryClient, session
 			await queryClient.cancelQueries({ queryKey, type: "inactive" });
 		}
 		await fallback();
-		return;
-	}
-	if (queryClient.isFetching({ queryKey, type: "active" }) > 0) {
-		// Joining a request that predates the event cannot acknowledge that event.
-		// Read its cursor, then catch up after it settles.
-		await fallback();
-		await refreshLocalConversation(queryClient, sessionId);
 		return;
 	}
 	if (!live?.changeCursor) {
@@ -1731,7 +1731,7 @@ export function toSnapshot(wire: WireSnapshot): ConversationSnapshot {
 	return {
 		changeCursor: wire.changeCursor,
 		visibleAfterSequence: wire.visibleAfterSequence,
-		afterSequence: wire.afterSequence,
+		afterSequence: wire.afterSequence ?? undefined,
 		continueTurnId: wire.continueTurnId,
 		conversationId: wire.conversationId,
 		sessionId: wire.sessionId,
