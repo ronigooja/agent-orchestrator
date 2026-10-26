@@ -261,6 +261,11 @@ func Run(buildVersion string) error {
 	// graceful shutdown inside Server.Run and stops the background goroutines.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var usage *usageTelemetryFlusher
+	if cfg.Telemetry.Events && cfg.Telemetry.Remote == config.TelemetryRemotePostHog && telemetryIdentity != nil {
+		usage = startUsageTelemetry(ctx, store, telemetrySink, telemetryIdentity, log)
+		defer usage.flush(context.Background(), false)
+	}
 	go telemetryPolicy.Watch(ctx, time.Second, cfg.Telemetry.Events, cfg.Telemetry.EventsExplicit, eventsAllowed, sentryobs.SetPolicyEnabled)
 	startGitHubLoginResolver(ctx, cfg, telemetryIdentity, log)
 	cdcPipe, err := startCDC(ctx, store, log)
@@ -532,6 +537,9 @@ func Run(buildVersion string) error {
 		return fmt.Errorf("reviewer resolver: %w", err)
 	}
 	sessionSvc, reviewSvc, wiredSessMgr, err := startSession(ctx, cfg, runtimeAdapter, store, lcStack.LCM, lcStack.ArtifactVersions, messenger, telemetrySink, notificationWriter, agents, agentSvc, managedPreview, browserBroker, browserAuthority, chatLauncher{svc: chatSvc, persistentHostReconcileDone: persistentHostsReconciled}, reviewerChatsRecovered, settingsSvc, tracker, codexOperationGate, reviewers, log)
+	if usage != nil && sessionSvc != nil {
+		sessionSvc.SetUsageArchiveFlush(func(ctx context.Context) { usage.flush(ctx, true) })
+	}
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -1019,8 +1027,13 @@ func Run(buildVersion string) error {
 		SessionSteps:       lcStack.LCM,
 		Telemetry:          telemetrySink,
 		TelemetryIdentity:  telemetryIdentity,
-		Mobile:             mc,
-		BrowserLive:        browserLive,
+		UsageFlush: func(ctx context.Context) {
+			if usage != nil {
+				usage.flush(ctx, false)
+			}
+		},
+		Mobile:      mc,
+		BrowserLive: browserLive,
 		DevImport: devimportsvc.New(devimportsvc.Deps{
 			Store:         store,
 			TargetDataDir: cfg.DataDir,

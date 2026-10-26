@@ -205,6 +205,7 @@ type Service struct {
 	clock               func() time.Time
 	dataDir             string
 	telemetry           ports.EventSink
+	usageArchiveFlush   func(context.Context)
 	logger              *slog.Logger
 	backgroundContext   context.Context
 	agentReadiness      ports.AgentReadinessProvider
@@ -328,6 +329,11 @@ func NewWithDeps(d Deps) *Service {
 	s.workspaceManifests.now = s.clock
 	s.commitSelections = newCommitSelectionCache(commitSelectionCacheSize)
 	return s
+}
+
+// SetUsageArchiveFlush sends pending session summaries after a user archive.
+func (s *Service) SetUsageArchiveFlush(flush func(context.Context)) {
+	s.usageArchiveFlush = flush
 }
 
 // Spawn creates a session and returns the API-facing read model plus
@@ -947,6 +953,9 @@ func (s *Service) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		return freed, apiErr
 	}
 	s.recordTerminated(ctx, id, domain.ActivityStatusCompleted, nil)
+	if s.usageArchiveFlush != nil {
+		s.usageArchiveFlush(ctx)
+	}
 	return freed, nil
 }
 
@@ -963,6 +972,9 @@ func (s *Service) RequestKill(ctx context.Context, id domain.SessionID) (session
 	// A later cleanup failure must not leave a completed action in chat.
 	if !result.CleanupPending {
 		s.recordTerminated(ctx, id, domain.ActivityStatusCompleted, nil)
+	}
+	if s.usageArchiveFlush != nil {
+		s.usageArchiveFlush(ctx)
 	}
 	return result, nil
 }
