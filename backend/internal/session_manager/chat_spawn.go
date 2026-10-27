@@ -321,9 +321,27 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 			}
 			return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, agentlaunch.RedactError(err, in.project.Config.Env))
 		}
-		// No controller exists, so nothing provider-side needs closing. The
-		// runtime was never touched, hence runtimeDestroyed=false.
+		// A failed driver may have created a runtime whose cleanup could not
+		// be proved. Keep the keyed row and workspace as a durable uncertainty
+		// marker so reconciliation cannot mistake missing state for rejection.
+		if in.cfg.Kind == domain.KindWorker && in.cfg.ClientRequestID != "" && !errors.Is(err, ports.ErrChatStartupClean) {
+			cleanupCtx, cancel := spawnRollbackContext(ctx)
+			m.preserveFailedSpawnWorkspace(cleanupCtx, id, in.workspace, false)
+			cancel()
+			m.markSpawnFailedTerminatedAfterFailure(ctx, id, false)
+			return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, agentlaunch.RedactError(err, in.project.Config.Env))
+		}
+		// A clean-startup marker proves the runtime is gone; the remaining
+		// rollback must also delete the workspace and durable seed row.
 		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false, in.promptQueued)
+		if in.cfg.Kind == domain.KindWorker && !in.promptQueued && errors.Is(err, ports.ErrChatStartupClean) {
+			cleanupCtx, cancel := spawnRollbackContext(ctx)
+			_, found, lookupErr := m.store.GetSession(cleanupCtx, id)
+			cancel()
+			if lookupErr == nil && !found {
+				return domain.SessionRecord{}, ErrWorkerBootFailed
+			}
+		}
 		return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, agentlaunch.RedactError(err, in.project.Config.Env))
 	}
 

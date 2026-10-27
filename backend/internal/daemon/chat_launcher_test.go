@@ -40,3 +40,18 @@ func TestChatLauncherForwardsSessionRelay(t *testing.T) {
 		})
 	}
 }
+
+func TestChatLauncherForwardsRequiredTerminationProof(t *testing.T) {
+	store := sqlitetest.MustOpen(t)
+	created, err := store.CreateSession(context.Background(), domain.SessionRecord{
+		Kind: domain.KindWorker, Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := chatLauncher{svc: chatsvc.New(chatsvc.Options{Sessions: store})}
+	proof, err := launcher.StopChatWithProof(context.Background(), created.ID)
+	if proof != (ports.ChatTerminationProof{}) || !errors.Is(err, chatsvc.ErrNoController) {
+		t.Fatalf("StopChatWithProof() = (%+v, %v), want the real chat service's missing-controller error", proof, err)
+	}
+}

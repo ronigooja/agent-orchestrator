@@ -1221,7 +1221,7 @@ func TestApprovalSettingsMirrorTUIPosture(t *testing.T) {
 
 func TestReadOnlyTurnCannotOverrideSandbox(t *testing.T) {
 	params := map[string]any{}
-	applyTurnSettings(params, ports.ChatTurnSettings{Approval: ports.PermissionModeAuto}, true, false)
+	applyTurnSettings(params, ports.ChatTurnSettings{Approval: ports.PermissionModeAuto}, true, false, false)
 	if params["approvalPolicy"] != "never" || params["approvalsReviewer"] != "user" ||
 		!reflect.DeepEqual(params["sandboxPolicy"], map[string]any{"type": "readOnly", "networkAccess": true}) {
 		t.Fatalf("read-only turn settings = %#v", params)

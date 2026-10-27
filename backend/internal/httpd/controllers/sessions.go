@@ -207,6 +207,7 @@ type SessionsController struct {
 // Register mounts the session routes on the supplied router.
 func (c *SessionsController) Register(r chi.Router) {
 	r.Get("/sessions", c.list)
+	r.Get("/sessions/inventory", c.inventory)
 	r.Post("/sessions", c.spawn)
 	r.Post("/sessions/cleanup", c.cleanup)
 	r.Get("/sessions/{sessionId}", c.get)
@@ -2065,9 +2066,26 @@ func (c *SessionsController) kill(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
 		return
 	}
-	result, err := c.Svc.RequestKill(r.Context(), sessionID(r))
+	var result sessionmanager.KillResult
+	var err error
+	if in.RequireTerminationProof {
+		service, ok := c.Svc.(interface {
+			RequestKillWithProof(context.Context, domain.SessionID) (sessionmanager.KillResult, error)
+		})
+		if !ok {
+			envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "TERMINATION_UNPROVEN", "AO could not verify native process exit; the session remains fenced", nil)
+			return
+		}
+		result, err = service.RequestKillWithProof(r.Context(), sessionID(r))
+	} else {
+		result, err = c.Svc.RequestKill(r.Context(), sessionID(r))
+	}
 	if err != nil {
 		envelope.WriteError(w, r, err)
+		return
+	}
+	if in.RequireTerminationProof && result.CleanupPending {
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "CLEANUP_PENDING", "AO process exit was verified, but session cleanup remains pending", nil)
 		return
 	}
 	// The session is already archived here, so a failed delete must not fail
@@ -2081,7 +2099,15 @@ func (c *SessionsController) kill(w http.ResponseWriter, r *http.Request) {
 			artifactsDeleted = true
 		}
 	}
-	envelope.WriteJSON(w, http.StatusOK, KillSessionResponse{OK: true, SessionID: sessionID(r), Freed: result.Freed, CleanupPending: result.CleanupPending, ArtifactsDeleted: artifactsDeleted})
+	var terminationProof *KillTerminationProof
+	if proof := result.TerminationProof; proof != nil {
+		terminationProof = &KillTerminationProof{Source: "ao_chat_stop", Method: string(proof.Method), SessionID: proof.SessionID, CleanupComplete: proof.CleanupComplete, VerifiedAt: proof.VerifiedAt.UTC()}
+	}
+	if in.RequireTerminationProof && (terminationProof == nil || terminationProof.Source != "ao_chat_stop" || terminationProof.SessionID != string(sessionID(r)) || !terminationProof.CleanupComplete || terminationProof.VerifiedAt.IsZero() || terminationProof.VerifiedAt.Location() != time.UTC || terminationProof.VerifiedAt.After(time.Now().UTC().Add(time.Minute)) || (terminationProof.Method != string(ports.ChatTerminationNativeProcessExitWaited) && terminationProof.Method != string(ports.ChatTerminationACPProcessExitWaited))) {
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "TERMINATION_UNPROVEN", "AO could not verify native process exit; the session remains fenced", nil)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, KillSessionResponse{OK: true, SessionID: sessionID(r), Freed: result.Freed, CleanupPending: result.CleanupPending, ArtifactsDeleted: artifactsDeleted, TerminationProof: terminationProof})
 }
 
 // rollback undoes a partially-completed spawn: if the session row is still in
@@ -2836,6 +2862,7 @@ func sessionView(r *http.Request, s domain.Session) SessionView {
 	terminalGeneration := s.Metadata.RuntimeLaunchID
 	view := SessionView{
 		Session:            s,
+		ClientRequestID:    s.ClientRequestID,
 		Branch:             s.Metadata.Branch,
 		TerminalGeneration: terminalGeneration,
 		PreviewURL:         s.Metadata.PreviewURL,
@@ -3184,4 +3211,29 @@ func workspaceSnapshotQuery(query url.Values) (sessionsvc.WorkspaceSelectionRevi
 // Source selectors must never be silently answered with mutable worktree data.
 func workspaceSnapshotRequested(query url.Values) bool {
 	return query.Get("snapshot") == "true" || query.Has("branch") || query.Has("prNumber") || query.Has("sourceUrl") || query.Has("expectedTipSha") || query.Has("expectedBaseSha") || query.Has("commitShas")
+}
+
+// inventory intentionally bypasses the display list, which hides preparation
+// rows and enriches status. Every durable row participates in absence proof.
+func (c *SessionsController) inventory(w http.ResponseWriter, r *http.Request) {
+	svc, ok := c.Svc.(interface {
+		SessionInventory(context.Context) ([]domain.SessionRecord, time.Time, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/inventory")
+		return
+	}
+	records, startedAt, err := svc.SessionInventory(r.Context())
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	out := SessionInventoryResponse{ServerStartedAt: startedAt, Sessions: make([]SessionIdentity, 0, len(records)), Complete: true, ClientRequestIDComplete: true}
+	for _, rec := range records {
+		out.Sessions = append(out.Sessions, SessionIdentity{ID: rec.ID, ProjectID: rec.ProjectID, ClientRequestID: rec.ClientRequestID})
+		if strings.TrimSpace(rec.ClientRequestID) == "" {
+			out.ClientRequestIDComplete = false
+		}
+	}
+	envelope.WriteJSON(w, http.StatusOK, out)
 }

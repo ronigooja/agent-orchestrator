@@ -31,6 +31,10 @@ var (
 	// ErrChatDriverUnavailable means the driver exists but its binary or
 	// bridge is missing.
 	ErrChatDriverUnavailable = errors.New("chat driver unavailable")
+	// ErrChatStartupClean proves a failed startup left no provider process or
+	// container and closed its credential broker. It says nothing about rows
+	// or workspaces; the manager must verify those separately.
+	ErrChatStartupClean = errors.New("chat startup failed with verified runtime cleanup")
 	// ErrChatDriverIncompatible means the installed provider speaks a protocol
 	// version AO does not support.
 	ErrChatDriverIncompatible = errors.New("chat driver incompatible")
@@ -1220,6 +1224,30 @@ type ChatProviderPreserver interface {
 // destruction must do more than detach the controller.
 type ChatProviderTerminator interface {
 	Terminate() error
+}
+
+// ChatTerminationProof is evidence returned only by providers that can wait
+// for the exact native process they own to exit. The method is a closed set so
+// an adapter cannot label a status observation as a process wait.
+type ChatTerminationProof struct {
+	SessionID       string
+	Method          ChatTerminationMethod
+	CleanupComplete bool
+	VerifiedAt      time.Time
+}
+
+type ChatTerminationMethod string
+
+const (
+	ChatTerminationNativeProcessExitWaited ChatTerminationMethod = "native_process_exit_waited"
+	ChatTerminationACPProcessExitWaited    ChatTerminationMethod = "acp_process_exit_waited"
+)
+
+// ChatProviderProofTerminator is implemented only when Terminate can return
+// evidence from the exact provider process handle.
+type ChatProviderProofTerminator interface {
+	CanTerminateWithProof() bool
+	TerminateWithProof() (ChatTerminationProof, error)
 }
 
 // ChatProviderHibernator stops the controller and provider process while

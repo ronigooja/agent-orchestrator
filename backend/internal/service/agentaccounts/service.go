@@ -62,6 +62,11 @@ type Service struct {
 	defaultChanged func(domain.AgentAccountProvider)
 }
 
+type sessionLaunchEnvProvider interface {
+	HasSessionLaunchEnv() bool
+	LaunchEnvForSession(home, sessionID string) map[string]string
+}
+
 // reading is the last identity and limits read for one account.
 type reading struct {
 	identity    domain.AgentAccountIdentityCheck
@@ -958,6 +963,12 @@ func (s *Service) launchEnv(ctx context.Context, id domain.SessionID, override d
 					errs = append(errs, err)
 				}
 			}
+		}
+		if sessionProvider, ok := provider.(sessionLaunchEnvProvider); ok && sessionProvider.HasSessionLaunchEnv() && override.Provider != p {
+			for key, value := range sessionProvider.LaunchEnvForSession(account.Home, string(id)) {
+				env[key] = value
+			}
+			continue
 		}
 		if account.Device() {
 			continue

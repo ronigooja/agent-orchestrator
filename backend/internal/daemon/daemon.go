@@ -519,7 +519,20 @@ func Run(buildVersion string) error {
 	if switcher, ok := wiredSessMgr.(chatsvc.TerminalProviderSwitcher); ok {
 		chatSvc.SetTerminalProviderSwitcher(switcher)
 	}
-	agentAccountSvc := newAgentAccounts(cfg, store, codexHome, agentDeps.CodexAccounts, log)
+	externalCodex, err := agentaccount.NewCodexExternalProfile(cfg.StateDir, os.Getenv("AO_CODEX_EXTERNAL_BASE_URL"), os.Getenv("AO_CODEX_EXTERNAL_API_KEY_FILE"), os.Getenv("AO_CODEX_EXTERNAL_MODEL"))
+	if err != nil {
+		stop()
+		lcStack.Stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("configure external Codex provider: %w", err)
+	}
+	if externalCodex != nil {
+		externalCodex.ContainerImage = strings.TrimSpace(os.Getenv("AO_CODEX_CONTAINER_IMAGE"))
+	}
+	sessionSvc.SetExternalCodexProvider(externalCodex)
+	agentAccountSvc := newAgentAccounts(cfg, store, codexHome, agentDeps.CodexAccounts, externalCodex, log)
 	chatSvc.SetUsageLimitAccounts(agentAccountSvc)
 	if wired, ok := sessMgr.(interface {
 		SetAgentAccounts(ports.AgentAccountLaunchEnv)
@@ -1367,7 +1380,7 @@ func stabilizeWorkingDirectory(dataDir string) error {
 // newAgentAccounts builds the Claude Code and Codex account catalog. Each
 // account is a config folder under the state dir; "This computer" is the CLI's
 // own folder, which AO never changes the login of.
-func newAgentAccounts(cfg config.Config, store *sqlite.Store, codexHome string, codexAccounts ports.CodexAccountClientFactory, log *slog.Logger) *agentaccounts.Service {
+func newAgentAccounts(cfg config.Config, store *sqlite.Store, codexHome string, codexAccounts ports.CodexAccountClientFactory, externalCodex *agentaccount.CodexExternalProfile, log *slog.Logger) *agentaccounts.Service {
 	claudeHome, claudeConfig := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")), ""
 	if claudeHome != "" {
 		claudeConfig = filepath.Join(claudeHome, ".claude.json")
@@ -1376,7 +1389,7 @@ func newAgentAccounts(cfg config.Config, store *sqlite.Store, codexHome string, 
 	}
 	providers := []ports.AgentAccountProviderCLI{
 		&agentaccount.Claude{Binary: claudecodeagent.New().ResolveBinary, DeviceHome: claudeHome, DeviceConfig: claudeConfig},
-		&agentaccount.Codex{Binary: codexagent.New().ResolveBinary, Accounts: codexAccounts, DeviceHome: codexHome},
+		&agentaccount.Codex{Binary: codexagent.New().ResolveBinary, Accounts: codexAccounts, DeviceHome: codexHome, External: externalCodex},
 	}
 	return agentaccounts.New(store, providers, filepath.Join(cfg.StateDir, "agent-accounts"), nil, log)
 }

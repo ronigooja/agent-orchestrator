@@ -43,9 +43,10 @@ func TestRunBackgroundTaskUsesNativeDriverAndTerminatesIt(t *testing.T) {
 		},
 	})
 
+	parentEnv := map[string]string{"CODEX_HOME": "/account", "ZOE_CODEX_SESSION_ID": "primary-worker"}
 	title, err := service.RunBackgroundTask(context.Background(), domain.HarnessCodex, ports.ChatStartConfig{
 		DataDir: "/data", WorkspacePath: "/workspace",
-		Env: map[string]string{"CODEX_HOME": "/account"}, Model: "small", Effort: "low",
+		Env: parentEnv, PrepareEnv: func(context.Context) (map[string]string, error) { return parentEnv, nil }, Model: "small", Effort: "low",
 		Permissions: ports.PermissionModeAuto, SystemPrompt: "title only",
 	}, "Fix the renderer")
 	if err != nil || title != "Fix renderer" {
@@ -56,6 +57,10 @@ func TestRunBackgroundTaskUsesNativeDriverAndTerminatesIt(t *testing.T) {
 	}
 	if started.Model != "small" || started.Effort != "" || started.Env["CODEX_HOME"] != "/account" {
 		t.Fatalf("start config = %#v", started)
+	}
+	preparedEnv, prepareErr := started.PrepareEnv(context.Background())
+	if prepareErr != nil || preparedEnv["ZOE_CODEX_SESSION_ID"] != string(started.SessionID) || started.Env["ZOE_CODEX_SESSION_ID"] != string(started.SessionID) || preparedEnv["ZOE_CODEX_RUNTIME_ROLE"] != "background" || parentEnv["ZOE_CODEX_SESSION_ID"] != "primary-worker" {
+		t.Fatal("background inherited or mutated primary runtime identity")
 	}
 	messages := conversation.sentMessages()
 	if len(messages) != 1 || messages[0].Text != "Fix the renderer" || messages[0].Origin != domain.MessageOriginAutomation {

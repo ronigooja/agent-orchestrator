@@ -2017,3 +2017,45 @@ func TestRunPromptSuggestionTaskPassesForkSourceWithScratchPolicy(t *testing.T) 
 		t.Fatal("scratch workspace survived suggestion")
 	}
 }
+
+func TestWorkerBootRejectionRequiresRuntimeCleanupAndAbsentRow(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                      string
+		startupErr                                                error
+		workspaceFails, rowDeleteFails, lookupFails, wantDefinite bool
+	}{
+		{"verified-clean", ports.ErrChatStartupClean, false, false, false, true},
+		{"runtime-unproven", errors.New("startup cleanup unverified"), false, false, false, false},
+		{"workspace-retained", ports.ErrChatStartupClean, true, false, false, false},
+		{"row-retained", ports.ErrChatStartupClean, false, true, false, false},
+		{"readback-failed", ports.ErrChatStartupClean, false, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			launcher := &recordingLauncher{startErr: tc.startupErr}
+			mgr, store, runtime := newChatManager(launcher)
+			mgr.dataDir = t.TempDir()
+			if tc.workspaceFails {
+				mgr.workspace.(*fakeWorkspace).destroyErr = errors.New("workspace busy")
+			}
+			if tc.rowDeleteFails {
+				store.deleteErr = errors.New("delete failed")
+			}
+			if tc.lookupFails {
+				launcher.beforeStart = func(ChatStart) { store.getSessionErr = errors.New("readback unavailable") }
+			}
+			_, _, _, err := mgr.Spawn(context.Background(), ports.SpawnConfig{
+				ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+				RequestedMode: domain.SessionModeChat, ClientRequestID: "boot-proof", ClientRequestHash: "fixture-hash",
+			})
+			if errors.Is(err, ErrWorkerBootFailed) != tc.wantDefinite {
+				t.Fatalf("err=%v, definite=%t", err, tc.wantDefinite)
+			}
+			if runtime.created != 0 {
+				t.Fatal("chat startup touched terminal runtime")
+			}
+			if tc.wantDefinite && len(store.sessions) != 0 {
+				t.Fatalf("clean rejection retained rows: %v", store.sessions)
+			}
+		})
+	}
+}

@@ -62,6 +62,9 @@ type process struct {
 	stop func() error
 	// terminate destroys a persistent host for explicit session shutdown.
 	terminate func() error
+	// terminateWithProof is set only by a supervised process handle whose exact
+	// container and attached Docker process are both synchronously reaped.
+	terminateWithProof func() (ports.ChatTerminationProof, error)
 }
 
 // spawnFunc launches an app-server. Injected so tests never exec anything.
@@ -164,6 +167,12 @@ func capabilities() ports.ChatCapabilities {
 // Probe reports what this install can do without creating a conversation, so an
 // unsupported request can be refused before AO commits a session or worktree.
 func (d *Driver) Probe(ctx context.Context) (ports.ChatCapabilities, error) {
+	if strings.TrimSpace(os.Getenv(containerImageEnv)) != "" && strings.TrimSpace(os.Getenv("AO_CODEX_EXTERNAL_BASE_URL")) != "" {
+		// The pinned supervised image owns the Codex binary. AO's deployment
+		// provider check proves the selected model before session creation; a
+		// host-side protocol probe here would require an unrelated host install.
+		return capabilities(), nil
+	}
 	bin, err := d.plugin.ResolveBinary(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
@@ -304,7 +313,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		return nil, errors.New("persistent chat host already owns a provider conversation for a fresh session")
 	}
 
-	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
+	policy, sandbox, reviewer := conversationApprovalSettings(conv, cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.disableNetwork = cfg.DisableNetwork
 	conv.launchMode = cfg.Permissions
@@ -390,7 +399,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return conv, nil
 	}
 
-	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
+	policy, sandbox, reviewer := conversationApprovalSettings(conv, cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.launchMode = cfg.Permissions
 	params := map[string]any{
@@ -515,22 +524,40 @@ func threadConfig(effort string, servers []ports.ChatMCPServerConfig) map[string
 
 // connect spawns app-server and completes the initialize handshake.
 func (d *Driver) connect(ctx context.Context, workdir string, env map[string]string, providerScopeID string) (*conversation, error) {
-	bin, err := d.plugin.ResolveBinary(ctx)
+	bin, launchEnv, err := d.launchConfig(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 	}
-
-	proc, err := d.spawn(ctx, bin, workdir, codexProcessEnv(ctx, bin, env))
+	proc, err := d.spawn(ctx, bin, workdir, launchEnv)
 	if err != nil {
 		return nil, fmt.Errorf("%w: launch app-server: %w", ports.ErrChatDriverUnavailable, err)
 	}
 
 	conv := newConversation(proc, d.log, providerScopeID)
+	conv.supervisedContainer, _ = supervisedExternalRoute(env, os.Getenv(containerImageEnv))
 	if err := d.initialize(ctx, conv); err != nil {
 		_ = conv.Close()
 		return nil, err
 	}
 	return conv, nil
+}
+
+func (d *Driver) launchConfig(ctx context.Context, env map[string]string) (string, []string, error) {
+	containerized, err := supervisedExternalRoute(env, os.Getenv(containerImageEnv))
+	if err != nil {
+		return "", nil, err
+	}
+	if containerized {
+		// The Codex executable belongs to the selected image. Resolving a host
+		// binary here would incorrectly require Codex to be installed on the AO
+		// daemon host before the supervised container can be launched.
+		return "", envSlice(env), nil
+	}
+	bin, err := d.plugin.ResolveBinary(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	return bin, codexProcessEnv(ctx, bin, env), nil
 }
 
 func (d *Driver) connectSession(
@@ -542,13 +569,32 @@ func (d *Driver) connectSession(
 	providerScopeID string,
 	reconnectOnly bool,
 ) (*conversation, bool, error) {
+	prepared := false
+	// A supervised image is deployment-selected, while its upstream route is
+	// added by the session profile's PrepareEnv callback. Resolve that profile
+	// before choosing between the native persistent host and the container.
+	if !reconnectOnly && prepareEnv != nil && strings.TrimSpace(os.Getenv(containerImageEnv)) != "" {
+		preparedEnv, err := prepareEnv(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		env = preparedEnv
+		prepared = true
+	}
+	// The external Codex route is a Zoe worker profile. When its supervised
+	// image is configured, do not attach to AO's persistent host: that host
+	// survives the controller and would escape the container PID namespace.
+	containerized, routeErr := supervisedExternalRoute(env, os.Getenv(containerImageEnv))
+	if routeErr != nil {
+		return nil, false, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, routeErr)
+	}
 	// Injected driver tests intentionally retain the direct pipe launcher. The
 	// shipped driver uses spawnAppServer and therefore the persistent host.
-	if !d.persistent {
+	if !d.persistent || containerized {
 		if reconnectOnly {
 			return nil, false, ports.ErrChatHostNotRunning
 		}
-		if prepareEnv != nil {
+		if prepareEnv != nil && !prepared {
 			var err error
 			env, err = prepareEnv(ctx)
 			if err != nil {
@@ -574,7 +620,7 @@ func (d *Driver) connectSession(
 		Env:           envSlice(env),
 		Argv:          []string{bin, "app-server"},
 	}
-	if prepareEnv != nil {
+	if prepareEnv != nil && !prepared {
 		hostConfig.Prepare = func(prepareCtx context.Context) (persistenthost.PreparedProvider, error) {
 			preparedEnv, prepareErr := prepareEnv(prepareCtx)
 			if prepareErr != nil {
@@ -719,8 +765,27 @@ func launchApprovalSettings(mode ports.PermissionMode, readOnly bool) (policy, s
 	return policy, sandbox, approvalReviewer(mode)
 }
 
+func conversationApprovalSettings(conv *conversation, mode ports.PermissionMode, readOnly bool) (policy, sandbox, reviewer string) {
+	policy, sandbox, reviewer = launchApprovalSettings(mode, readOnly)
+	if conv != nil && conv.supervisedContainer && !readOnly {
+		// Codex's nested bwrap sandbox cannot start under the deployment's
+		// unprivileged container seccomp profile. The host-level container has no
+		// network, a read-only rootfs, and only the project worktree writable.
+		sandbox = "danger-full-access"
+	}
+	return policy, sandbox, reviewer
+}
+
 // spawnAppServer is the real launcher.
 func spawnAppServer(ctx context.Context, bin, workdir string, env []string) (*process, error) {
+	containerEnv := environmentMap(env)
+	containerized, err := supervisedExternalRoute(containerEnv, containerEnv[containerImageEnv])
+	if err != nil {
+		return nil, err
+	}
+	if containerized {
+		return spawnContainerAppServer(ctx, workdir, env)
+	}
 	args := []string{"app-server"}
 	cmd := aoprocess.Command(bin, args...)
 	cmd.Dir = workdir
@@ -822,7 +887,7 @@ func (d *Driver) ForkIntoHost(ctx context.Context, sourceProviderConversationID,
 		_ = conv.Close()
 		return nil, errors.New("side provider host already owns a conversation")
 	}
-	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
+	policy, sandbox, reviewer := conversationApprovalSettings(conv, cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.disableNetwork = cfg.DisableNetwork
 	conv.launchMode = cfg.Permissions

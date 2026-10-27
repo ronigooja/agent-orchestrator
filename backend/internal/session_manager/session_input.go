@@ -122,6 +122,9 @@ func (m *Manager) beginAgentOperation(ctx context.Context, id domain.SessionID, 
 		m.agentOperations[id] = kind
 		drained = m.inputDrained[id]
 		m.agentOpMu.Unlock()
+		if kind == agentOperationResume || kind == agentOperationRestore || kind == agentOperationProviderSwitch {
+			m.forgetTerminationProof(id)
+		}
 		break
 	}
 	if drained == nil {

@@ -5117,6 +5117,22 @@ func TestSessionsAPI_KillKeepsArtifactsByDefault(t *testing.T) {
 	}
 }
 
+func TestSessionsAPI_RequiredTerminationProofFailsClosedAndLegacyKillRemainsCompatible(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/kill", `{"requireTerminationProof":true}`)
+	if status != http.StatusConflict || !strings.Contains(string(body), "TERMINATION_UNPROVEN") || svc.sessions["ao-1"].IsTerminated {
+		t.Fatalf("required proof response = %d %s, session terminated=%v; want fail-closed conflict", status, body, svc.sessions["ao-1"].IsTerminated)
+	}
+
+	legacy := newFakeSessionService()
+	legacyServer := newSessionTestServer(t, legacy)
+	body, status, _ = doRequest(t, legacyServer, http.MethodPost, "/api/v1/sessions/ao-1/kill", `{"requireTerminationProof":false}`)
+	if status != http.StatusOK || !legacy.sessions["ao-1"].IsTerminated || strings.Contains(string(body), "terminationProof") {
+		t.Fatalf("legacy kill response = %d %s, terminated=%v", status, body, legacy.sessions["ao-1"].IsTerminated)
+	}
+}
+
 func TestSessionsAPI_KillDeletesArtifactsWhenAsked(t *testing.T) {
 	svc := newFakeSessionService()
 	srv := newSessionTestServer(t, svc)
@@ -5231,6 +5247,46 @@ func TestSessionsAPI_SourceSelectorCannotFallBackToLiveFiles(t *testing.T) {
 			body, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1/workspace/"+route+"?path=src&branch=feature", "")
 			if status != http.StatusOK || svc.workspaceSnapshotInput.View.Branch != "feature" {
 				t.Fatalf("source selector fell back to the worktree: %d %s input=%+v", status, body, svc.workspaceSnapshotInput)
+			}
+		})
+	}
+}
+
+func (f *fakeSessionService) SessionInventory(context.Context) ([]domain.SessionRecord, time.Time, error) {
+	out := make([]domain.SessionRecord, 0, len(f.sessions))
+	for _, s := range f.sessions {
+		out = append(out, s.SessionRecord)
+	}
+	return out, time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC), nil
+}
+
+func TestSessionIdentityInventoryIncludesIncompleteAndLegacyRows(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		rows         []domain.SessionRecord
+		wantIdentity bool
+	}{
+		{"empty", nil, true},
+		{"all-identified", []domain.SessionRecord{{ID: "seed", ClientRequestID: "run", IsTaskPreparation: true}, {ID: "stopped", ClientRequestID: "old", IsTerminated: true}}, true},
+		{"legacy", []domain.SessionRecord{{ID: "legacy"}, {ID: "known", ClientRequestID: "run"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			svc.sessions = make(map[domain.SessionID]domain.Session)
+			for _, row := range tc.rows {
+				row.Metadata.Prompt = "private fixture prompt"
+				row.ClientRequestHash = "private fixture hash"
+				svc.sessions[row.ID] = domain.Session{SessionRecord: row}
+			}
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/sessions/inventory?project=ignored&active=true", "")
+			var got controllers.SessionInventoryResponse
+			mustJSON(t, body, &got)
+			if status != http.StatusOK || !got.Complete || got.ServerStartedAt.IsZero() || got.ClientRequestIDComplete != tc.wantIdentity || len(got.Sessions) != len(tc.rows) || got.Sessions == nil {
+				t.Fatalf("status=%d inventory=%+v", status, got)
+			}
+			if strings.Contains(string(body), "private fixture") {
+				t.Fatalf("private inventory fields leaked: %s", body)
 			}
 		})
 	}

@@ -54,6 +54,9 @@ type conversation struct {
 	providerScopeID string
 	readOnly        bool
 	disableNetwork  bool
+	// supervisedContainer means the deployment's read-only container, network
+	// boundary, and scoped workspace mount provide the host-level sandbox.
+	supervisedContainer bool
 	// launchMode is the permission mode the thread started or resumed with;
 	// a turn without its own approval setting runs under it.
 	launchMode ports.PermissionMode
@@ -94,15 +97,19 @@ type conversation struct {
 	// once.
 	compactedTurn string
 
-	pumpDone     chan struct{}
-	eventsMu     sync.RWMutex
-	eventsClosed bool
-	closeOnce    sync.Once
-	closeErr     error
+	pumpDone          chan struct{}
+	eventsMu          sync.RWMutex
+	eventsClosed      bool
+	closeMu           sync.Mutex
+	approvalsFailed   bool
+	detachComplete    bool
+	terminateComplete bool
+	closeErr          error
 }
 
 var _ ports.ChatConversation = (*conversation)(nil)
 var _ ports.ChatProviderHibernator = (*conversation)(nil)
+var _ ports.ChatProviderProofTerminator = (*conversation)(nil)
 
 // Asserted here so a refactor cannot silently drop model listing: the service
 // feature-detects this interface, and a missed method would just mean "no models"
@@ -353,7 +360,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		// must not produce a second turn.
 		params["clientUserMessageId"] = msg.ClientMessageID
 	}
-	applyTurnSettings(params, msg.Settings, c.readOnly, c.disableNetwork)
+	applyTurnSettings(params, msg.Settings, c.readOnly, c.disableNetwork, c.supervisedContainer)
 	// A service tier sticks to the thread once set, so leaving the fast tier
 	// has to be said: an explicit null returns the thread to its default.
 	if msg.Settings.Fast {
@@ -403,7 +410,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 // Only fields the caller actually chose are sent. An omitted field lets the
 // provider fall back to what the thread was started with, which is why a caller
 // that chooses nothing behaves exactly as it did before per-turn settings existed.
-func applyTurnSettings(params map[string]any, settings ports.ChatTurnSettings, readOnly, disableNetwork bool) {
+func applyTurnSettings(params map[string]any, settings ports.ChatTurnSettings, readOnly, disableNetwork, supervisedContainer bool) {
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
@@ -428,6 +435,11 @@ func applyTurnSettings(params map[string]any, settings ports.ChatTurnSettings, r
 		params["approvalPolicy"] = "never"
 		params["approvalsReviewer"] = "user"
 		params["sandboxPolicy"] = map[string]any{"type": "readOnly", "networkAccess": !disableNetwork}
+	} else if supervisedContainer {
+		// Pin the turn-level override too: app-server threads can resume with
+		// stored settings that predate the container boundary or came from another
+		// controller. The host enforces the actual writable paths and networking.
+		params["sandboxPolicy"] = map[string]any{"type": "dangerFullAccess"}
 	}
 }
 
@@ -1009,29 +1021,65 @@ func (c *conversation) failPendingApprovals() {
 
 // Close releases the controller without touching provider-side history.
 func (c *conversation) Close() error {
-	c.closeOnce.Do(func() {
-		if c.proc.terminate == nil {
-			c.failPendingApprovals()
-		}
-		if c.proc.stop != nil {
-			c.closeErr = c.proc.stop()
-		}
-	})
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.detachComplete || c.terminateComplete {
+		return nil
+	}
+	if !c.approvalsFailed && c.proc.terminate == nil {
+		c.failPendingApprovals()
+		c.approvalsFailed = true
+	}
+	if c.proc.stop != nil {
+		c.closeErr = c.proc.stop()
+	}
+	if c.closeErr == nil {
+		c.detachComplete = true
+	}
 	return c.closeErr
 }
 
 // Terminate destroys the provider host. Close only detaches and is used by
 // daemon-wide shutdown; explicit session/controller replacement calls this.
 func (c *conversation) Terminate() error {
-	c.closeOnce.Do(func() {
-		c.failPendingApprovals()
-		if c.proc.terminate != nil {
-			c.closeErr = c.proc.terminate()
-		} else if c.proc.stop != nil {
-			c.closeErr = c.proc.stop()
+	_, err := c.terminateWithEvidence(false)
+	return err
+}
+
+func (c *conversation) TerminateWithProof() (ports.ChatTerminationProof, error) {
+	return c.terminateWithEvidence(true)
+}
+
+func (c *conversation) CanTerminateWithProof() bool { return c.proc.terminateWithProof != nil }
+
+func (c *conversation) terminateWithEvidence(requireProof bool) (ports.ChatTerminationProof, error) {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.terminateComplete {
+		if requireProof && c.proc.terminateWithProof != nil {
+			return c.proc.terminateWithProof()
 		}
-	})
-	return c.closeErr
+		return ports.ChatTerminationProof{}, nil
+	}
+	if !c.approvalsFailed {
+		c.failPendingApprovals()
+		c.approvalsFailed = true
+	}
+	var proof ports.ChatTerminationProof
+	if requireProof && c.proc.terminateWithProof != nil {
+		proof, c.closeErr = c.proc.terminateWithProof()
+	} else if requireProof {
+		c.closeErr = errors.New("provider does not expose native process wait evidence")
+	} else if c.proc.terminate != nil {
+		c.closeErr = c.proc.terminate()
+	} else if c.proc.stop != nil {
+		c.closeErr = c.proc.stop()
+	}
+	if c.closeErr == nil {
+		c.terminateComplete = true
+		c.detachComplete = true
+	}
+	return proof, c.closeErr
 }
 
 // CanHibernate reads Codex's live exec registry, since a settled turn can leave

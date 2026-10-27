@@ -2735,6 +2735,58 @@ func (c *Controller) Terminate(ctx context.Context) error {
 	}
 }
 
+// TerminateWithProof explicitly stops the controller and asks the same exact
+// provider handle for waited process evidence. Providers without that handle
+// fail closed even when their ordinary Terminate call succeeds.
+func terminationProofMethodForHarness(harness domain.AgentHarness) (ports.ChatTerminationMethod, bool) {
+	switch harness {
+	case domain.HarnessCodex:
+		return ports.ChatTerminationNativeProcessExitWaited, true
+	case domain.HarnessOpenCode:
+		return ports.ChatTerminationACPProcessExitWaited, true
+	default:
+		return "", false
+	}
+}
+
+func (c *Controller) CanTerminateWithProof() bool {
+	if _, ok := terminationProofMethodForHarness(c.harness); !ok {
+		return false
+	}
+	terminator, ok := c.conv.(ports.ChatProviderProofTerminator)
+	return ok && terminator.CanTerminateWithProof()
+}
+
+func (c *Controller) TerminateWithProof(ctx context.Context) (ports.ChatTerminationProof, error) {
+	expectedMethod, supportedHarness := terminationProofMethodForHarness(c.harness)
+	terminator, ok := c.conv.(ports.ChatProviderProofTerminator)
+	if !supportedHarness || !ok || !terminator.CanTerminateWithProof() {
+		return ports.ChatTerminationProof{}, errors.New("provider does not expose waited process evidence for this harness")
+	}
+	// Obtain proof before consuming Controller's once-only close path. A failed
+	// process stop leaves the provider handle retryable; a later retry must not
+	// be trapped behind a cached controller error.
+	proof, err := terminator.TerminateWithProof()
+	if err != nil {
+		return ports.ChatTerminationProof{}, err
+	}
+	if proof.SessionID == "" || proof.Method != expectedMethod || !proof.CleanupComplete || proof.VerifiedAt.IsZero() {
+		return ports.ChatTerminationProof{}, errors.New("provider returned incomplete native process wait evidence")
+	}
+	if err := c.Terminate(ctx); err != nil {
+		// An earlier ordinary Stop may have consumed the once-only path and
+		// cached its provider error. Fresh native process-exit proof supersedes
+		// that stale error only after this controller's event loop has stopped.
+		select {
+		case <-c.stopped:
+			return proof, nil
+		case <-ctx.Done():
+			return ports.ChatTerminationProof{}, errors.Join(err, ctx.Err())
+		}
+	}
+	return proof, nil
+}
+
 // closeForBranchHandoff retires and terminates a source controller without
 // publishing a session-level exit. Branch replacement is an in-place writer
 // handoff, not the end of the session; the replacement generation continues the

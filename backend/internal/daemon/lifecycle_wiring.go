@@ -614,6 +614,9 @@ var _ sessionmanager.ChatLauncher = chatLauncher{}
 var _ sessionmanager.ChatVersionRefresher = chatLauncher{}
 var _ sessionmanager.ChatUpdateHibernator = chatLauncher{}
 var _ interface {
+	StopChatWithProof(context.Context, domain.SessionID) (ports.ChatTerminationProof, error)
+} = chatLauncher{}
+var _ interface {
 	RunBackgroundTask(context.Context, domain.AgentHarness, ports.ChatStartConfig, string) (string, error)
 	RunPromptSuggestionTask(context.Context, domain.SessionID, string, domain.AgentHarness, ports.ChatStartConfig, string) (string, error)
 	ArmChatHandoff(context.Context, domain.SessionID, domain.SessionInterfaceTransitionPolicy) error
@@ -791,6 +794,10 @@ func (c chatLauncher) AbortChatHandoff(id domain.SessionID) {
 
 func (c chatLauncher) StopChat(ctx context.Context, id domain.SessionID) error {
 	return c.svc.StopChat(ctx, id)
+}
+
+func (c chatLauncher) StopChatWithProof(ctx context.Context, id domain.SessionID) (ports.ChatTerminationProof, error) {
+	return c.svc.StopChatWithProof(ctx, id)
 }
 
 // reviewPRRefresher lets a review trigger fetch a worker's PR fresh from the

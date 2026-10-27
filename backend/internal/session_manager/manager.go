@@ -132,26 +132,29 @@ var (
 	// "spawn <id>:" so wrapping them does not change daemon-log wording, while
 	// errors.Is can tell the service which stage failed. More specific wrapped
 	// sentinels (branch, agent binary, chat preflight) still match first.
-	ErrSpawnPrompt             = errors.New("prompt")
-	ErrSpawnCreate             = errors.New("create")
-	ErrSpawnSystemPrompt       = errors.New("system prompt file")
-	ErrSpawnArtifactDir        = errors.New("artifact dir")
-	ErrSpawnAgentAccount       = errors.New("agent account")
-	ErrWorkspaceCreate         = errors.New("workspace")
-	ErrWorkspaceProvision      = errors.New("provision")
-	ErrSpawnAttachments        = errors.New("attachments")
-	ErrSpawnBrowser            = errors.New("browser capability")
-	ErrSpawnPrepare            = errors.New("prepare")
-	ErrSpawnPromptDelivery     = errors.New("prompt delivery")
-	ErrSpawnLaunchCommand      = errors.New("launch command")
-	ErrSpawnSupervisor         = errors.New("supervisor")
-	ErrSpawnPrepareLaunch      = errors.New("prepare launch")
-	ErrRuntimeCreate           = errors.New("runtime")
-	ErrSpawnCommit             = errors.New("completed")
-	ErrSpawnDeliverPrompt      = errors.New("deliver prompt")
-	ErrClientRequestConflict   = errors.New("client request id belongs to a different task")
-	ErrClientRequestIncomplete = errors.New("client request has an incomplete prior spawn")
-	ErrChatController          = errors.New("chat controller")
+	ErrSpawnPrompt               = errors.New("prompt")
+	ErrSpawnCreate               = errors.New("create")
+	ErrSpawnSystemPrompt         = errors.New("system prompt file")
+	ErrSpawnArtifactDir          = errors.New("artifact dir")
+	ErrSpawnAgentAccount         = errors.New("agent account")
+	ErrWorkspaceCreate           = errors.New("workspace")
+	ErrWorkspaceProvision        = errors.New("provision")
+	ErrSpawnAttachments          = errors.New("attachments")
+	ErrSpawnBrowser              = errors.New("browser capability")
+	ErrSpawnPrepare              = errors.New("prepare")
+	ErrSpawnPromptDelivery       = errors.New("prompt delivery")
+	ErrSpawnLaunchCommand        = errors.New("launch command")
+	ErrSpawnSupervisor           = errors.New("supervisor")
+	ErrSpawnPrepareLaunch        = errors.New("prepare launch")
+	ErrRuntimeCreate             = errors.New("runtime")
+	ErrSpawnCommit               = errors.New("completed")
+	ErrSpawnDeliverPrompt        = errors.New("deliver prompt")
+	ErrClientRequestConflict     = errors.New("client request id belongs to a different task")
+	ErrClientRequestIncomplete   = errors.New("client request has an incomplete prior spawn")
+	ErrChatController            = errors.New("chat controller")
+	ErrWorkerBootFailed          = errors.New("worker boot failed without remaining session or runtime")
+	ErrTerminationUnproven       = errors.New("native process termination is unproven")
+	ErrTerminationCleanupPending = errors.New("session cleanup is pending")
 )
 
 // wrapSpawnStage annotates a spawn failure with a stage sentinel. The original
@@ -415,6 +418,11 @@ type Manager struct {
 	// killTeardown bounds Kill's detached teardown. Zero means
 	// killTeardownBudget; tests shrink it to prove what survives its expiry.
 	killTeardown time.Duration
+	// terminationProofs retains exact waited evidence for idempotent required
+	// kill retries in this daemon. It is intentionally volatile: after restart,
+	// AO cannot recreate proof from a terminal session row.
+	terminationProofsMu sync.Mutex
+	terminationProofs   map[domain.SessionID]cachedTerminationProof
 	// openTranscriptFile is os.Open in production. The narrow seam lets tests
 	// deterministically prove that a post-stop transcript read failure falls
 	// back without advertising the provider path.
@@ -2503,23 +2511,80 @@ func (m *Manager) recordTermination(ctx context.Context, id domain.SessionID, dr
 
 // KillResult distinguishes accepted cleanup from a preserved workspace.
 type KillResult struct {
-	Freed          bool
-	CleanupPending bool
+	Freed            bool
+	CleanupPending   bool
+	TerminationProof *ports.ChatTerminationProof
+}
+
+type cachedTerminationProof struct {
+	Proof                  ports.ChatTerminationProof
+	Harness                domain.AgentHarness
+	ProviderConversationID string
+	AgentSessionID         string
 }
 
 // Kill waits for workspace retirement for internal callers that depend on it.
 func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
-	result, err := m.kill(ctx, id, false)
+	result, err := m.kill(ctx, id, false, false)
 	return result.Freed, err
 }
 
 // RequestKill stops the agent and persists terminal intent before returning.
 // Configured cleanup commands use the daemon's existing background workers.
 func (m *Manager) RequestKill(ctx context.Context, id domain.SessionID) (KillResult, error) {
-	return m.kill(ctx, id, true)
+	return m.kill(ctx, id, true, false)
 }
 
-func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundCleanup bool) (KillResult, error) {
+// RequestKillWithProof is the opt-in kill path used by callers that must prove
+// the exact provider process exited before acknowledging cleanup.
+func (m *Manager) RequestKillWithProof(ctx context.Context, id domain.SessionID) (KillResult, error) {
+	return m.kill(ctx, id, true, true)
+}
+
+func (m *Manager) cachedTerminationProof(id domain.SessionID, rec domain.SessionRecord) *ports.ChatTerminationProof {
+	m.terminationProofsMu.Lock()
+	defer m.terminationProofsMu.Unlock()
+	cached, ok := m.terminationProofs[id]
+	if !ok {
+		return nil
+	}
+	if cached.Harness != rec.Harness || cached.ProviderConversationID != rec.Metadata.ProviderConversationID || cached.AgentSessionID != rec.Metadata.AgentSessionID {
+		delete(m.terminationProofs, id)
+		return nil
+	}
+	proof := cached.Proof
+	return &proof
+}
+
+func (m *Manager) forgetTerminationProof(id domain.SessionID) {
+	m.terminationProofsMu.Lock()
+	delete(m.terminationProofs, id)
+	m.terminationProofsMu.Unlock()
+}
+
+func (m *Manager) rememberTerminationProof(id domain.SessionID, rec domain.SessionRecord, proof ports.ChatTerminationProof) {
+	m.terminationProofsMu.Lock()
+	defer m.terminationProofsMu.Unlock()
+	if m.terminationProofs == nil {
+		m.terminationProofs = make(map[domain.SessionID]cachedTerminationProof)
+	}
+	if _, exists := m.terminationProofs[id]; !exists {
+		m.terminationProofs[id] = cachedTerminationProof{Proof: proof, Harness: rec.Harness, ProviderConversationID: rec.Metadata.ProviderConversationID, AgentSessionID: rec.Metadata.AgentSessionID}
+	}
+}
+
+func terminationMethodForHarness(harness domain.AgentHarness) (ports.ChatTerminationMethod, bool) {
+	switch harness {
+	case domain.HarnessCodex:
+		return ports.ChatTerminationNativeProcessExitWaited, true
+	case domain.HarnessOpenCode, domain.HarnessOpenCodeV2:
+		return ports.ChatTerminationACPProcessExitWaited, true
+	default:
+		return "", false
+	}
+}
+
+func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundCleanup, requireTerminationProof bool) (KillResult, error) {
 	// Teardown deliberately stops riding the caller's context. Kill runs a
 	// sequence (stop the agent, tear the controller down, mark the row
 	// terminated, drop the worktree) where being cancelled partway leaves a session
@@ -2587,12 +2652,44 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundClean
 		return KillResult{}, fmt.Errorf("kill %s: preserve attachments: %w", id, err)
 	}
 
+	var terminationProof *ports.ChatTerminationProof
+	if requireTerminationProof {
+		terminationProof = m.cachedTerminationProof(id, rec)
+	}
 	// Exactly one controller exists, so exactly one gets torn down. A chat
 	// session has no runtime handle; its controller owns an app-server child
 	// process, and closing it also settles any turn left in flight so a later
 	// read does not show work that is no longer running.
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
-		m.stopChatBestEffort(ctx, id)
+		if requireTerminationProof {
+			if terminationProof != nil {
+				// The exact proof belongs to this still-current AO session and is
+				// reused after a prior stop succeeded but later cleanup failed.
+			} else {
+				stopper, ok := m.chat.(interface {
+					StopChatWithProof(context.Context, domain.SessionID) (ports.ChatTerminationProof, error)
+				})
+				if !ok {
+					m.logger.Warn("required chat termination proof rejected", "sessionID", id, "stage", "stop_chat_proof_interface", "harness", rec.Harness, "provider_proof_interface", false)
+					return KillResult{}, fmt.Errorf("kill %s: %w", id, ErrTerminationUnproven)
+				}
+				proof, proofErr := stopper.StopChatWithProof(ctx, id)
+				expectedMethod, methodKnown := terminationMethodForHarness(rec.Harness)
+				sessionMatches := proof.SessionID == string(id)
+				methodMatches := methodKnown && proof.Method == expectedMethod
+				verifiedAtPresent := !proof.VerifiedAt.IsZero()
+				verifiedAtUTC := verifiedAtPresent && proof.VerifiedAt.Location() == time.UTC
+				verifiedAtNotFuture := verifiedAtPresent && !proof.VerifiedAt.After(time.Now().UTC().Add(time.Minute))
+				if proofErr != nil || !methodKnown || !sessionMatches || !methodMatches || !proof.CleanupComplete || !verifiedAtPresent || !verifiedAtUTC || !verifiedAtNotFuture {
+					m.logger.Warn("required chat termination proof rejected", "sessionID", id, "stage", "stop_chat_proof_validate", "harness", rec.Harness, "proof_error_present", proofErr != nil, "proof_error_type", fmt.Sprintf("%T", proofErr), "method_known", methodKnown, "session_matches", sessionMatches, "method_matches", methodMatches, "cleanup_complete", proof.CleanupComplete, "verified_at_present", verifiedAtPresent, "verified_at_utc", verifiedAtUTC, "verified_at_not_future", verifiedAtNotFuture)
+					return KillResult{}, fmt.Errorf("kill %s: %w", id, errors.Join(ErrTerminationUnproven, proofErr))
+				}
+				terminationProof = &proof
+				m.rememberTerminationProof(id, rec, proof)
+			}
+		} else {
+			m.stopChatBestEffort(ctx, id)
+		}
 	} else if handle.ID != "" {
 		// Any Destroy error stops the kill. Every runtime's Destroy already
 		// returns nil when it confirms the session is absent, so an error means
@@ -2603,6 +2700,9 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundClean
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
 			return KillResult{}, fmt.Errorf("kill %s: runtime: %w", id, err)
 		}
+	}
+	if requireTerminationProof && terminationProof == nil {
+		return KillResult{}, fmt.Errorf("kill %s: %w", id, ErrTerminationUnproven)
 	}
 	if err := m.terminateReviewer(ctx, id, "cancelled by worker session termination"); err != nil {
 		return KillResult{}, fmt.Errorf("kill %s: reviewer: %w", id, err)
@@ -2666,7 +2766,11 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundClean
 						m.logger.Error("record background workspace cleanup", "sessionID", id, "error", err)
 					}
 				})
-				return KillResult{CleanupPending: true}, nil
+				result := KillResult{CleanupPending: true, TerminationProof: terminationProof}
+				if requireTerminationProof {
+					return result, ErrTerminationCleanupPending
+				}
+				return result, nil
 			}
 		}
 		if err := m.runPreRemove(rec.ProjectID, ws.Path); err != nil {
@@ -2703,7 +2807,7 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundClean
 			return KillResult{}, err
 		}
 	}
-	return KillResult{Freed: freed}, nil
+	return KillResult{Freed: freed, TerminationProof: terminationProof}, nil
 }
 
 // RetireForReplacement terminates a live orchestrator and releases its branch

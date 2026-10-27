@@ -4026,6 +4026,40 @@ func TestKillCleanupScriptHasNoTimeLimit(t *testing.T) {
 	}
 }
 
+func TestRequiredTerminationProofCacheReplaysExactProofAndIsVolatileAcrossRestart(t *testing.T) {
+	first := &Manager{}
+	verifiedAt := time.Date(2026, time.October, 21, 12, 34, 56, 123000000, time.UTC)
+	proof := ports.ChatTerminationProof{
+		SessionID:       "ao-session-exact",
+		Method:          ports.ChatTerminationNativeProcessExitWaited,
+		CleanupComplete: true,
+		VerifiedAt:      verifiedAt,
+	}
+	rec := domain.SessionRecord{ID: domain.SessionID(proof.SessionID), Harness: domain.HarnessCodex, IsTerminated: true}
+	first.rememberTerminationProof(rec.ID, rec, proof)
+	replayed := first.cachedTerminationProof(rec.ID, rec)
+	if replayed == nil || *replayed != proof {
+		t.Fatalf("cached proof = %+v, want exact original proof %+v", replayed, proof)
+	}
+	if first.cachedTerminationProof("other-session", rec) != nil {
+		t.Fatal("termination proof was returned for an unrelated session")
+	}
+	active := rec
+	active.IsTerminated = false
+	if replayed := first.cachedTerminationProof(rec.ID, active); replayed == nil || *replayed != proof {
+		t.Fatal("partial teardown retry lost the exact process wait proof")
+	}
+	first.forgetTerminationProof(rec.ID)
+	if first.cachedTerminationProof(rec.ID, active) != nil {
+		t.Fatal("proof remained after a new resume/restore generation invalidated it")
+	}
+
+	second := &Manager{}
+	if second.cachedTerminationProof(rec.ID, rec) != nil {
+		t.Fatal("new manager fabricated proof after restart without process wait evidence")
+	}
+}
+
 func TestKillCleanupScriptFailurePreservesWorkspaceForRetry(t *testing.T) {
 	m, st, rt, ws := newManager()
 	m.dataDir = t.TempDir()

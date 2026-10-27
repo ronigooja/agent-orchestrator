@@ -48,6 +48,7 @@ type Codex struct {
 	Binary     func(context.Context) (string, error)
 	Accounts   ports.CodexAccountClientFactory
 	DeviceHome string // the computer's own CODEX_HOME (~/.codex)
+	External   *CodexExternalProfile
 }
 
 var _ ports.AgentAccountProviderCLI = (*Codex)(nil)
@@ -56,7 +57,7 @@ var _ ports.AgentAccountProviderCLI = (*Codex)(nil)
 func (*Codex) Provider() domain.AgentAccountProvider { return domain.AgentAccountProviderCodex }
 
 // LaunchEnv points Codex at home.
-func (*Codex) LaunchEnv(home string) map[string]string {
+func (c *Codex) LaunchEnv(home string) map[string]string {
 	if home == "" {
 		return nil
 	}
@@ -64,6 +65,18 @@ func (*Codex) LaunchEnv(home string) map[string]string {
 	neutralize(env, codexCredentialEnv...)
 	return env
 }
+
+// LaunchEnvForSession opts AO worker sessions into the configured external API
+// profile. Account login terminals continue to use LaunchEnv and retain their
+// native account home.
+func (c *Codex) LaunchEnvForSession(home, sessionID string) map[string]string {
+	if c.External != nil {
+		return c.External.RuntimeEnvForSession(sessionID)
+	}
+	return c.LaunchEnv(home)
+}
+
+func (c *Codex) HasSessionLaunchEnv() bool { return c.External != nil }
 
 // LoginArgv is Codex's own sign-in with a device code, so the user picks the
 // ChatGPT account in any browser instead of the one already signed in there.

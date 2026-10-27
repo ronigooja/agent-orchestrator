@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -32,6 +33,27 @@ func (s *Service) RunBackgroundTask(ctx context.Context, harness domain.AgentHar
 	// shortcut: ACP ignores ReadOnly and DisableNetwork; enforce tool restrictions when those providers support them.
 	cfg.ReadOnly = true
 	cfg.DisableNetwork = true
+	// Background work has an independent lifecycle; never inherit the parent
+	// worker's Docker session identity or mutate its retained environment.
+	isolateEnv := func(env map[string]string) map[string]string {
+		isolated := maps.Clone(env)
+		if isolated == nil {
+			isolated = make(map[string]string)
+		}
+		isolated["ZOE_CODEX_SESSION_ID"] = string(cfg.SessionID)
+		isolated["ZOE_CODEX_RUNTIME_ROLE"] = "background"
+		return isolated
+	}
+	cfg.Env = isolateEnv(cfg.Env)
+	if prepare := cfg.PrepareEnv; prepare != nil {
+		cfg.PrepareEnv = func(ctx context.Context) (map[string]string, error) {
+			env, err := prepare(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return isolateEnv(env), nil
+		}
+	}
 	conversation, err := driver.Start(ctx, cfg)
 	if err != nil {
 		return "", fmt.Errorf("start background %s task: %w", harness, err)

@@ -1689,6 +1689,13 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		return err
 	}
 	defer gate.unlock()
+	return s.stopLocked(ctx, id, nil)
+}
+
+// stopLocked performs teardown while the owner gate is held. expected pins a
+// proof-bearing caller to the exact controller whose provider handle it stopped.
+func (s *Service) stopLocked(ctx context.Context, id domain.SessionID, expected *Controller) error {
+	owner := domain.SessionConversationOwner(id)
 	// Each side is marked closed before its host stops, and a host that fails to
 	// stop stays queued for the periodic cleanup retry. Stopping the main chat
 	// (Exit agent, agent switch, spawn rollback) must not depend on it.
@@ -1703,6 +1710,26 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 	s.mu.RLock()
 	controller, ok := s.controllers[id]
 	s.mu.RUnlock()
+	if expected != nil {
+		if ok && controller != expected {
+			return errors.New("chat controller changed during required-proof stop")
+		}
+		if !ok {
+			select {
+			case <-expected.stopped:
+				// A prior ordinary stop may have retired this exact controller
+				// after its event loop observed process exit. The required proof
+				// still belongs to that generation; no replacement is present.
+				s.mu.Lock()
+				delete(s.startConfigs, owner)
+				delete(s.awakeInterrupted, owner)
+				s.mu.Unlock()
+				return s.clearHibernation(ctx, id)
+			default:
+				return errors.New("chat controller changed during required-proof stop")
+			}
+		}
+	}
 	if !ok {
 		s.mu.Lock()
 		delete(s.startConfigs, owner)
@@ -1724,7 +1751,19 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		// Explicit Kill can still retry authenticated shutdown of this owner.
 		hostErr = s.stopProviderHost(ctx, id)
 	}
-	err := errors.Join(hostErr, controller.Terminate(ctx))
+	err := hostErr
+	if expected == nil {
+		err = errors.Join(err, controller.Terminate(ctx))
+	} else {
+		// Required proof has already stopped and waited for this exact
+		// controller. Replaying Terminate here could re-surface a cached error
+		// from an earlier ordinary stop after cleanup has now succeeded.
+		select {
+		case <-controller.stopped:
+		default:
+			return errors.Join(err, errors.New("proof-bearing controller has not stopped"))
+		}
+	}
 	if preserved && !hibernating && s.stopProviderHost != nil {
 		// Close may already have retired this handle (for example after a failed
 		// projection). Explicit Stop targets current session ownership under the
@@ -2802,6 +2841,40 @@ func (s *Service) RelaySessionChatTurn(ctx context.Context, id domain.SessionID,
 // StopChat releases a session's controller.
 func (s *Service) StopChat(ctx context.Context, id domain.SessionID) error {
 	return s.Stop(ctx, id)
+}
+
+// StopChatWithProof stops one session controller and returns waited evidence
+// from that controller's exact provider handle. A session whose controller was
+// already discarded has no retained proof and therefore fails closed.
+func (s *Service) StopChatWithProof(ctx context.Context, id domain.SessionID) (ports.ChatTerminationProof, error) {
+	owner := domain.SessionConversationOwner(id)
+	gate := s.controllerGate(owner)
+	if err := gate.lock(ctx); err != nil {
+		return ports.ChatTerminationProof{}, err
+	}
+	defer gate.unlock()
+	record, err := s.requireChatSession(ctx, id)
+	if err != nil {
+		return ports.ChatTerminationProof{}, err
+	}
+	controller, err := s.Controller(id)
+	if err != nil {
+		return ports.ChatTerminationProof{}, err
+	}
+	if controller.harness != record.Harness {
+		return ports.ChatTerminationProof{}, errors.New("persisted harness does not match the proof-bearing controller")
+	}
+	if !controller.CanTerminateWithProof() {
+		return ports.ChatTerminationProof{}, errors.New("provider does not expose waited process evidence for the persisted harness")
+	}
+	proof, err := controller.TerminateWithProof(ctx)
+	if err != nil {
+		return ports.ChatTerminationProof{}, err
+	}
+	if err := s.stopLocked(ctx, id, controller); err != nil {
+		return proof, err
+	}
+	return proof, nil
 }
 
 // permissionConfigOptions annotates only provider controls whose semantics are

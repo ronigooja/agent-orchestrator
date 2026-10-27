@@ -3173,6 +3173,79 @@ func TestSpawnStillRejectsFreshUnauthorizedCodexAccount(t *testing.T) {
 	}
 }
 
+type fakeExternalCodexProvider struct {
+	configured bool
+	err        error
+	models     []string
+}
+
+func (p *fakeExternalCodexProvider) Configured() bool { return p.configured }
+func (p *fakeExternalCodexProvider) Check(_ context.Context, model string) error {
+	p.models = append(p.models, model)
+	return p.err
+}
+
+func TestSpawnUsesExplicitExternalCodexProviderReadiness(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	fc := &fakeCommander{}
+	readiness := &fakeAgentReadiness{snapshot: domain.AgentReadinessSnapshot{
+		ID: "codex", Installation: domain.AgentInstallationObservation{State: domain.AgentInstallationInstalled},
+		Authentication: domain.AgentAuthenticationObservation{State: domain.AgentAuthenticationUnauthorized, Freshness: domain.AgentReadinessFresh},
+	}}
+	provider := &fakeExternalCodexProvider{configured: true}
+	svc := NewWithDeps(Deps{Manager: fc, Store: st, AgentReadiness: readiness})
+	svc.SetExternalCodexProvider(provider)
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessCodex, AgentConfig: ports.AgentConfig{Model: "gpt-6-luna"}})
+	if err != nil {
+		t.Fatalf("external provider spawn: %v", err)
+	}
+	if fc.spawnCalls != 1 || readiness.calls != 0 || len(provider.models) != 1 || provider.models[0] != "gpt-6-luna" {
+		t.Fatalf("spawn=%d native readiness=%d external models=%v", fc.spawnCalls, readiness.calls, provider.models)
+	}
+}
+
+func TestSpawnFailsClosedWhenExternalCodexModelProbeFails(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	fc := &fakeCommander{}
+	provider := &fakeExternalCodexProvider{configured: true, err: errors.New("private provider detail")}
+	svc := NewWithDeps(Deps{Manager: fc, Store: st})
+	svc.SetExternalCodexProvider(provider)
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessCodex, AgentConfig: ports.AgentConfig{Model: "gpt-6-luna"}})
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "CODEX_EXTERNAL_PROVIDER_UNAVAILABLE" {
+		t.Fatalf("Spawn error=%v", err)
+	}
+	if fc.spawnCalls != 0 {
+		t.Fatalf("manager.Spawn ran despite failed external-provider proof")
+	}
+	if strings.Contains(err.Error(), "private provider detail") {
+		t.Fatalf("provider error leaked: %v", err)
+	}
+}
+
+func TestSpawnExplicitCodexAccountDoesNotSwitchToExternalProvider(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	fc := &fakeCommander{}
+	readiness := &fakeAgentReadiness{snapshot: domain.AgentReadinessSnapshot{
+		ID: "codex", Installation: domain.AgentInstallationObservation{State: domain.AgentInstallationInstalled},
+		Authentication: domain.AgentAuthenticationObservation{State: domain.AgentAuthenticationUnauthorized, Freshness: domain.AgentReadinessFresh},
+	}}
+	provider := &fakeExternalCodexProvider{configured: true}
+	svc := NewWithDeps(Deps{Manager: fc, Store: st, AgentReadiness: readiness})
+	svc.SetExternalCodexProvider(provider)
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessCodex, AgentAccountID: "native-account", AgentConfig: ports.AgentConfig{Model: "gpt-6-luna"}})
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "CODEX_ACCOUNT_AUTH_UNVERIFIED" {
+		t.Fatalf("explicit native account spawn error=%v", err)
+	}
+	if len(provider.models) != 0 || readiness.calls != 1 || fc.spawnCalls != 0 {
+		t.Fatalf("external models=%v readiness=%d spawn=%d", provider.models, readiness.calls, fc.spawnCalls)
+	}
+}
+
 // The readiness gate reads the computer's own Codex login. A task that will run
 // on a saved account does not use that login, so its state is not a reason to
 // refuse; the launch checks the account it runs on.
@@ -5982,5 +6055,44 @@ func TestDeleteArtifactsAcceptsTheCanonicalArtifactDir(t *testing.T) {
 	}
 	if len(deleter.deleted) != 1 {
 		t.Fatalf("deleted = %v, want [mer-1]", deleter.deleted)
+	}
+}
+
+func TestWorkerBootFailureMapsOnlyVerifiedManagerProof(t *testing.T) {
+	mapped := toSpawnAPIError(fmt.Errorf("spawn: %w", sessionmanager.ErrWorkerBootFailed))
+	var api *apierr.Error
+	if !errors.As(mapped, &api) || api.Kind != apierr.KindConflict || api.Code != "worker_boot_failed" {
+		t.Fatalf("mapped=%v", mapped)
+	}
+	unproven := toSpawnAPIError(fmt.Errorf("spawn: %w", ports.ErrChatStartupClean))
+	if errors.As(unproven, &api) && api.Code == "worker_boot_failed" {
+		t.Fatal("runtime-only proof accepted without row/workspace proof")
+	}
+}
+
+func TestSessionInventoryWaitsForAdmittedSpawnAndKeepsProcessIncarnation(t *testing.T) {
+	st := newFakeStore()
+	entered, release, spawnDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	fc := &fakeCommander{spawnErr: errors.New("fixture start failure"), spawnHook: func(context.Context) { close(entered); <-release }}
+	svc := &Service{manager: fc, store: st}
+	go func() {
+		defer close(spawnDone)
+		_, _, _, _ = svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex})
+	}()
+	<-entered
+	inventoryDone := make(chan struct{})
+	var gotStarted time.Time
+	go func() { defer close(inventoryDone); _, gotStarted, _ = svc.SessionInventory(context.Background()) }()
+	select {
+	case <-inventoryDone:
+		t.Fatal("inventory overtook an admitted create")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-spawnDone
+	<-inventoryDone
+	_, secondStarted, err := (&Service{store: st}).SessionInventory(context.Background())
+	if err != nil || gotStarted.IsZero() || !gotStarted.Equal(secondStarted) || gotStarted.Location() != time.UTC {
+		t.Fatalf("unstable process incarnation: %v %v %v", gotStarted, secondStarted, err)
 	}
 }

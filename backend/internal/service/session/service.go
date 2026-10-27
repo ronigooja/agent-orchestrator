@@ -25,6 +25,10 @@ import (
 
 const maxDisplayNameLen = 100
 
+// Captured once per AO process, independently of injected test clocks or service
+// reconstruction. A newer incarnation fences delivery of an old create request.
+var sessionServerStartedAt = time.Now().UTC()
+
 // Store is the read-only persistence surface needed to assemble controller-facing session read models.
 type Store interface {
 	GetSessionCleanupFacts(ctx context.Context, id domain.SessionID) (domain.SessionCleanupRecord, bool, error)
@@ -184,10 +188,18 @@ type outputTypeReconciler interface {
 	ReconcileSessionOutputType(ctx context.Context, id domain.SessionID) error
 }
 
+type externalCodexProvider interface {
+	Configured() bool
+	Check(context.Context, string) error
+}
+
 // Service is the controller-facing session service. It delegates command-side
 // session operations to the internal sessionmanager.Manager and owns read-model
 // assembly, including user-facing display status derivation.
 type Service struct {
+	// inventoryGate serializes identity snapshots after every create already
+	// admitted by this service has settled. It does not fence future requests.
+	inventoryGate       sync.RWMutex
 	manager             commander
 	store               Store
 	prClaimer           ports.PRClaimer
@@ -199,6 +211,7 @@ type Service struct {
 	logger              *slog.Logger
 	backgroundContext   context.Context
 	agentReadiness      ports.AgentReadinessProvider
+	externalCodex       externalCodexProvider
 	runBackground       func(func())
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
@@ -324,6 +337,8 @@ func NewWithDeps(d Deps) *Service {
 // Spawn creates a session and returns the API-facing read model plus
 // ephemeral prompt size measurements.
 func (s *Service) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, int, int, error) {
+	s.inventoryGate.RLock()
+	defer s.inventoryGate.RUnlock()
 	if rec, found, err := s.replayClientRequest(ctx, cfg.ClientRequestID, cfg.ClientRequestHash); err != nil {
 		return domain.Session{}, 0, 0, err
 	} else if found {
@@ -380,7 +395,13 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.Session{}, 0, 0, apierr.Invalid("HARNESS_REQUIRED", "harness is required for a standalone session", nil)
 		}
 	}
-	if s.agentReadiness != nil && cfg.Harness != "" {
+	externalCodexSelected := cfg.Harness == domain.HarnessCodex && cfg.AgentAccountID == "" && s.externalCodex != nil && s.externalCodex.Configured()
+	if externalCodexSelected {
+		if err := s.externalCodex.Check(ctx, cfg.AgentConfig.Model); err != nil {
+			return domain.Session{}, 0, 0, apierr.Conflict("CODEX_EXTERNAL_PROVIDER_UNAVAILABLE", "The configured external Codex provider did not prove access to the selected model", nil)
+		}
+	}
+	if !externalCodexSelected && s.agentReadiness != nil && cfg.Harness != "" {
 		readiness, err := s.agentReadiness.EnsureAgentReadiness(ctx, string(cfg.Harness), domain.AgentReadinessPurposeLaunch)
 		if err != nil {
 			return domain.Session{}, 0, 0, err
@@ -406,6 +427,13 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.Session{}, 0, 0, err
 	}
 	return sess, promptBytes, systemPromptBytes, nil
+}
+
+// SetExternalCodexProvider enables the explicitly deployment-configured API
+// route. Native account identity remains available through Agent Accounts; only
+// the Codex launch readiness gate follows this route when it is configured.
+func (s *Service) SetExternalCodexProvider(provider externalCodexProvider) {
+	s.externalCodex = provider
 }
 
 // spawnWithTelemetry is the only path from the service into manager.Spawn, so
@@ -912,6 +940,20 @@ func (s *Service) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 func (s *Service) RequestKill(ctx context.Context, id domain.SessionID) (sessionmanager.KillResult, error) {
 	s.cancelTitleRefinement(id)
 	result, err := s.manager.RequestKill(ctx, id)
+	return result, toAPIError(err)
+}
+
+// RequestKillWithProof opts into a stop path that must return exact native
+// process wait evidence before the kill is acknowledged.
+func (s *Service) RequestKillWithProof(ctx context.Context, id domain.SessionID) (sessionmanager.KillResult, error) {
+	s.cancelTitleRefinement(id)
+	manager, ok := s.manager.(interface {
+		RequestKillWithProof(context.Context, domain.SessionID) (sessionmanager.KillResult, error)
+	})
+	if !ok {
+		return sessionmanager.KillResult{}, sessionmanager.ErrTerminationUnproven
+	}
+	result, err := manager.RequestKillWithProof(ctx, id)
 	return result, toAPIError(err)
 }
 
@@ -1427,6 +1469,10 @@ func mapSessionError(err error) error {
 		return apierr.Conflict("SESSION_NOT_RESTORABLE", "Session is not restorable", nil)
 	case errors.Is(err, sessionmanager.ErrTerminated):
 		return apierr.Conflict("SESSION_TERMINATED", "Session is terminated", nil)
+	case errors.Is(err, sessionmanager.ErrTerminationUnproven):
+		return apierr.Conflict("TERMINATION_UNPROVEN", "AO could not verify native process exit; the session remains fenced", nil)
+	case errors.Is(err, sessionmanager.ErrTerminationCleanupPending):
+		return apierr.Conflict("CLEANUP_PENDING", "AO process exit was verified, but session cleanup remains pending", nil)
 	case errors.Is(err, sessionmanager.ErrAgentExited):
 		return apierr.Conflict("AGENT_EXITED",
 			"The agent process exited; relaunch it before sending another message", nil)
@@ -1571,6 +1617,9 @@ func toSpawnAPIError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, sessionmanager.ErrWorkerBootFailed) {
+		return apierr.Conflict("worker_boot_failed", "Worker startup failed; AO verified runtime cleanup and absence of a session", nil)
+	}
 	var already *apierr.Error
 	if errors.As(err, &already) {
 		return already
@@ -1711,4 +1760,13 @@ func (s *Service) harnessSignals(h domain.AgentHarness) bool {
 		return false
 	}
 	return s.signalCapable(h)
+}
+
+// SessionInventory reads all durable rows without runtime probes, enrichment,
+// pagination, or preparation filtering. It cannot create or restore a runtime.
+func (s *Service) SessionInventory(ctx context.Context) ([]domain.SessionRecord, time.Time, error) {
+	s.inventoryGate.Lock()
+	defer s.inventoryGate.Unlock()
+	records, err := s.store.ListAllSessions(ctx)
+	return records, sessionServerStartedAt, err
 }

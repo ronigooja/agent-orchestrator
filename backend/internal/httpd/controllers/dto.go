@@ -445,6 +445,7 @@ type WorkspaceTreeEntry struct {
 // prs is a list. The embedded domain.Session.Metadata and domain.Session.PRs
 // fields are json:"-"; these curated fields are what serialize.
 type SessionView struct {
+	ClientRequestID string `json:"clientRequestId,omitempty"`
 	domain.Session
 	Branch string `json:"branch,omitempty"`
 	// TerminalGeneration is an opaque renderer fence. A restarted controller
@@ -1151,16 +1152,26 @@ type InterfaceTransitionNoticeAckResponse struct {
 // DeleteArtifacts empties the session's artifact directory once it is
 // terminated. Only the archive dialog sets it; the CLI and the reaper never do.
 type KillSessionRequest struct {
-	DeleteArtifacts bool `json:"deleteArtifacts,omitempty"`
+	DeleteArtifacts         bool `json:"deleteArtifacts,omitempty"`
+	RequireTerminationProof bool `json:"requireTerminationProof,omitempty"`
+}
+
+type KillTerminationProof struct {
+	Source          string    `json:"source"`
+	Method          string    `json:"method"`
+	SessionID       string    `json:"sessionId"`
+	CleanupComplete bool      `json:"cleanupComplete"`
+	VerifiedAt      time.Time `json:"verifiedAt"`
 }
 
 // KillSessionResponse is the body of POST /api/v1/sessions/{sessionId}/kill.
 type KillSessionResponse struct {
-	OK               bool             `json:"ok"`
-	SessionID        domain.SessionID `json:"sessionId"`
-	Freed            bool             `json:"freed,omitempty"`
-	CleanupPending   bool             `json:"cleanupPending,omitempty"`
-	ArtifactsDeleted bool             `json:"artifactsDeleted,omitempty"`
+	OK               bool                  `json:"ok"`
+	SessionID        domain.SessionID      `json:"sessionId"`
+	Freed            bool                  `json:"freed,omitempty"`
+	CleanupPending   bool                  `json:"cleanupPending,omitempty"`
+	ArtifactsDeleted bool                  `json:"artifactsDeleted,omitempty"`
+	TerminationProof *KillTerminationProof `json:"terminationProof,omitempty"`
 }
 
 // RollbackSessionResponse is the body of POST /api/v1/sessions/{sessionId}/rollback.
@@ -3804,4 +3815,17 @@ type SwitchSessionAgentAccountRequest struct {
 	// StopTurn cancels a turn in progress, for an agent stuck waiting on the old
 	// account's limit. Otherwise the move waits for the turn to finish.
 	StopTurn bool `json:"stopTurn,omitempty"`
+}
+
+// SessionInventoryResponse is the unfiltered durable identity inventory.
+type SessionInventoryResponse struct {
+	ServerStartedAt         time.Time         `json:"serverStartedAt"`
+	Sessions                []SessionIdentity `json:"sessions"`
+	Complete                bool              `json:"complete"`
+	ClientRequestIDComplete bool              `json:"clientRequestIdComplete"`
+}
+type SessionIdentity struct {
+	ID              domain.SessionID `json:"id"`
+	ProjectID       domain.ProjectID `json:"projectId"`
+	ClientRequestID string           `json:"clientRequestId"`
 }
