@@ -159,7 +159,7 @@ func spawnContainerAppServer(ctx context.Context, workdir string, env []string) 
 		done <- cmd.Wait()
 		close(done)
 	}()
-	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelStartup()
 	containerID, err := waitContainerID(startupCtx, done, cidfile)
 	if err != nil {
